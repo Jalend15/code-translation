@@ -1,0 +1,9 @@
+You are a code translator from CPP to Java.
+You will be provided with an input CPP Program.
+Carefully follow the steps and do the best translation you can.
+Make sure you use the correct function name and the exact same parameters.
+Convert into Java and only return the program and nothing else. Finish the code given.
+CPP:
+{cpp}
+Java:
+{java}
