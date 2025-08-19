@@ -1,11 +1,14 @@
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import pandas as pd
 from tqdm import tqdm
-
+import os
 # Ensure tqdm is set up for Pandas
 tqdm.pandas()
+os.environ["HF_HOME"] = "/mnt/nfs/users/jalend/"
+os.environ["TRANSFORMERS_CACHE"] = "/mnt/nfs/users/jalend/transformers_cache"
 
-checkpoint = "bigcode/starcoderbase-7b"
+
+checkpoint = "bigcode/starcoderbase-3b"
 device = "cuda"  # for GPU usage or "cpu" for CPU usage
 
 tokenizer_starcoderbase = AutoTokenizer.from_pretrained(checkpoint, max_new_tokens=1024)
@@ -35,20 +38,22 @@ def load_model_and_tokenizer(checkpoint_dir):
 # Inference function
 def run_inference(prompt, model, tokenizer):
     inputs = tokenizer.encode(prompt, return_tensors="pt").to(device)
-    outputs = model.generate(inputs, max_new_tokens=500)  # Generate text
+    outputs = model.generate(inputs, max_new_tokens=250)  # Generate text
     # Generate text
 
     # Decode the output tensor to text
     generated_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
-    print(generated_text)
+    # print(generated_text)
     return generated_text
 
 
 
 for i in range(len(df_source)):
     text = df_source.iloc[i]["prompt"]
-    output = run_inference(text, model_starcoderbase, tokenizer_starcoderbase)
+    code = df_source.iloc[i]["canonical_solution"]
+    output = run_inference(text+"\n\n"+code, model_starcoderbase, tokenizer_starcoderbase)
     print("Model's output:", output)
+    break
 
 
 
