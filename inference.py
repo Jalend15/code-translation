@@ -1,68 +1,96 @@
-from transformers import AutoModelForCausalLM, AutoTokenizer
+# pip install -U transformers accelerate bitsandbytes peft
+import os
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 import pandas as pd
 from tqdm import tqdm
-import os
-# Ensure tqdm is set up for Pandas
+
 tqdm.pandas()
 os.environ["HF_HOME"] = "/mnt/nfs/users/jalend/"
 os.environ["TRANSFORMERS_CACHE"] = "/mnt/nfs/users/jalend/transformers_cache"
 
+checkpoint = "bigcode/starcoderbase-7b"
+device_map = "auto"  # let Accelerate place layers across GPUs/CPU if needed
 
-checkpoint = "bigcode/starcoderbase-3b"
-device = "cuda"  # for GPU usage or "cpu" for CPU usage
 
-tokenizer_starcoderbase = AutoTokenizer.from_pretrained(checkpoint, max_new_tokens=1024)
-model_starcoderbase = AutoModelForCausalLM.from_pretrained(checkpoint).to(device)
+# 4-bit quantization config (NF4 + bfloat16 compute is a strong default on A6000)
+bnb_config = BitsAndBytesConfig(
+    load_in_4bit=True,
+    bnb_4bit_use_double_quant=True,
+    bnb_4bit_quant_type="nf4",
+    bnb_4bit_compute_dtype=torch.bfloat16,
+)
 
+# IMPORTANT: max_new_tokens is NOT a tokenizer arg; remove it from tokenizer init
+tokenizer = AutoTokenizer.from_pretrained(checkpoint, use_fast=True)
+if tokenizer.pad_token is None:
+    tokenizer.pad_token = tokenizer.eos_token  # safe pad for causal LM
+
+if "3b" in checkpoint:
+    model = AutoModelForCausalLM.from_pretrained(
+        checkpoint,
+        quantization_config=bnb_config,
+        device_map=device_map,
+        torch_dtype=torch.bfloat16,
+    )
+else:
+    model = AutoModelForCausalLM.from_pretrained(
+        checkpoint,
+        device_map=device_map,
+        torch_dtype=torch.bfloat16,
+    )
+
+# Data
 source_lang = "rust"
 dest_lang = "java"
-df_source = pd.read_csv(f"data/{source_lang}.csv")
-df_dest = pd.read_csv(f"data/{dest_lang}.csv")
+df_source = pd.read_csv(f"data/{source_lang}.csv")  # expects 'prompt' and 'canonical_solution'
+df_dest   = pd.read_csv(f"data/{dest_lang}.csv")    # you'll attach generations here later
 
+# Prompt template (use your file)
+with open(f"data/gpt_human_eval_{source_lang}_{dest_lang}.txt", "r") as f:
+    prompt_template = f.read()
 
-prompt_path = f"data/gpt_human_eval_{source_lang}_{dest_lang}.txt"
-with open(prompt_path, "r") as prompt_file:
-    prompt_obj = prompt_file.read()
+gen_kwargs = dict(
+    max_new_tokens=250,
+    do_sample=False,            # deterministic for Pass@1 eval
+    temperature=0.0,
+    top_p=1.0,
+    eos_token_id=tokenizer.eos_token_id,
+    pad_token_id=tokenizer.pad_token_id,
+)
 
-count = 0
-length = 0
+def build_prompt(nl_prompt, src_code):
+    # Your original code concatenated prompt+code with no separator; make it explicit.
+    # If your template already contains placeholders, adapt accordingly.
+    return f"{nl_prompt}\n\n# Source ({source_lang}):\n{src_code}\n\n# Target ({dest_lang}):\n"
 
+@torch.inference_mode()
+def run_inference(prompt: str):
+    inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+    out = model.generate(**inputs, **gen_kwargs)
+    text = tokenizer.decode(out[0], skip_special_tokens=True)
+    # Return ONLY what the model added after the prompt
+    return text[len(tokenizer.decode(inputs['input_ids'][0], skip_special_tokens=True)):]
+    # If your tokenizer detokenization trims whitespace differently, alternatively:
+    # return text.split("# Target", 1)[-1]
 
-# Function to load model and tokenizer
-def load_model_and_tokenizer(checkpoint_dir):
-    model = AutoModelForCausalLM.from_pretrained(checkpoint_dir)
-    tokenizer = AutoTokenizer.from_pretrained(checkpoint_dir)
-    return model, tokenizer
+# # Example single run
+# example_prompt = build_prompt(df_source.iloc[0]["prompt"], df_source.iloc[0]["canonical_solution"])
+# print(run_inference(example_prompt))
 
-
-# Inference function
-def run_inference(prompt, model, tokenizer):
-    inputs = tokenizer.encode(prompt, return_tensors="pt").to(device)
-    outputs = model.generate(inputs, max_new_tokens=250)  # Generate text
-    # Generate text
-
-    # Decode the output tensor to text
-    generated_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
-    # print(generated_text)
-    return generated_text
-
-
-
-for i in range(len(df_source)):
-    text = df_source.iloc[i]["prompt"]
-    code = df_source.iloc[i]["canonical_solution"]
-    output = run_inference(text+"\n\n"+code, model_starcoderbase, tokenizer_starcoderbase)
-    print("Model's output:", output)
+# Full loop + save predictions
+pred = []
+for i in tqdm(range(len(df_source))):
+    nl = df_source.iloc[i]["prompt"]
+    src = df_source.iloc[i]["canonical_solution"]
+    prompt = build_prompt(nl, src)
+    pred.append(run_inference(prompt))
+    print("Model output:")
+    print(pred[-1])
     break
 
-
-
-# # Load only the first `len(pred)` rows from the CSV
-# df_java = pd.read_csv(f"data/{dest_lang}.csv", nrows=len(pred))
-
-# # Add the predictions to the DataFrame
-# df_java["generation"] = pred
-
-# # Save the updated DataFrame
-# output_path = f"{source_lang}_{dest_lang}_with_predictions_starcoderbase7b_164.csv"
-# df_java.to_csv(output_path, index=False)
+df_out = df_dest.iloc[:len(pred)].copy()
+df_out["generation"] = pred
+out_path = f"{source_lang}_{dest_lang}_with_predictions_starcoderbase3b_4bit.csv"
+df_out.to_csv(out_path, index=False)
+print(f"Saved {out_path}")
